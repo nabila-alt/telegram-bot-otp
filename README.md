@@ -74,7 +74,3 @@ BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyZ
 ```
 
 ---
-
-## 📄 Lisensi
-
-Proyek ini dilisensikan di bawah lisensi **MIT**.
