@@ -7,7 +7,21 @@ const TOKEN = process.env.BOT_TOKEN;
 const OWNER_ID = parseInt(process.env.OWNER_ID || '0', 10);
 const BOT_NAME = process.env.BOT_NAME || 'SMS KU';
 const DEFAULT_LIMIT = parseInt(process.env.MAX_FREE_LIMIT || '3', 10);
-const ZELAPI_BASE_URL = 'https://smsku.zelapi.eu.cc';
+
+const SERVER_CONFIG = {
+  server1: {
+    name: process.env.SERVER_1_NAME || 'SERVER SATU',
+    baseUrl: process.env.SERVER_1_URL || 'https://smsku.zelapi.eu.cc'
+  },
+  server2: {
+    name: process.env.SERVER_2_NAME || 'SERVER DUA',
+    baseUrl: process.env.SERVER_2_URL || ''
+  },
+  server3: {
+    name: process.env.SERVER_3_NAME || 'SERVER TIGA',
+    baseUrl: process.env.SERVER_3_URL || ''
+  }
+};
 
 if (!TOKEN) {
   console.error('ERROR: BOT_TOKEN tidak ditemukan di .env');
@@ -15,7 +29,7 @@ if (!TOKEN) {
 }
 
 const bot = new Telegraf(TOKEN);
-const db = new Database('zelapi_bot.db');
+const db = new Database(process.env.DATABASE_PATH || 'zelapi_bot.db');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -27,7 +41,7 @@ db.exec(`
     custom_limit INTEGER DEFAULT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
-  
+
   CREATE TABLE IF NOT EXISTS user_sessions (
     user_id INTEGER PRIMARY KEY,
     state TEXT,
@@ -66,6 +80,7 @@ const stmtUpsertUser = db.prepare(`
     first_name = excluded.first_name,
     phone_number = COALESCE(excluded.phone_number, users.phone_number)
 `);
+
 const stmtUpdateUserSuspend = db.prepare('UPDATE users SET is_suspended = ? WHERE user_id = ?');
 const stmtUpdateUserLimit = db.prepare('UPDATE users SET custom_limit = ? WHERE user_id = ?');
 
@@ -116,6 +131,22 @@ const stmtGetUserOtpCount = db.prepare(`
   SELECT COUNT(*) as total FROM otp_history WHERE user_id = ?
 `);
 
+function getAvailableServers() {
+  return Object.entries(SERVER_CONFIG)
+    .filter(([, cfg]) => cfg.baseUrl && cfg.baseUrl.trim() !== '')
+    .map(([key, cfg]) => ({ key, ...cfg }));
+}
+
+function getServerByKey(serverKey) {
+  return SERVER_CONFIG[serverKey] || SERVER_CONFIG.server1;
+}
+
+function getSelectedServerKey(userId) {
+  const session = stmtGetSession.get(userId);
+  if (session && session.data) return session.data;
+  return 'server1';
+}
+
 bot.use(async (ctx, next) => {
   if (ctx.from) {
     const u = stmtGetUser.get(ctx.from.id);
@@ -129,7 +160,7 @@ bot.use(async (ctx, next) => {
 async function safeAnswerCb(ctx, text = '', options = {}) {
   try {
     if (ctx.callbackQuery) await ctx.answerCbQuery(text, options);
-  } catch (err) {}
+  } catch {}
 }
 
 function getWibTimestamp(dateObj = new Date()) {
@@ -159,7 +190,7 @@ function formatPhoneNumber(rawNumber) {
   if (!rawNumber) return '-';
   let cleaned = cleanNumStr(rawNumber);
   if (!cleaned.startsWith('+')) cleaned = '+' + cleaned;
-  
+
   if (cleaned.startsWith('+62')) return cleaned.replace(/^(\+62)(\d{3})(\d{4})(\d{3,4})$/, '$1 $2-$3-$4');
   if (cleaned.startsWith('+1')) return cleaned.replace(/^(\+1)(\d{3})(\d{3})(\d{4})$/, '$1 ($2) $3-$4');
   if (cleaned.length > 10) return cleaned.replace(/^(\+\d{1,3})(\d{3,4})(\d{4,8})$/, '$1 $2-$3');
@@ -176,53 +207,72 @@ function getUserMaxLimit(userId) {
 }
 
 class ZelApiClient {
-  static async getServices() {
+  static getBaseUrl(serverKey = 'server1') {
+    return getServerByKey(serverKey).baseUrl;
+  }
+
+  static async getServices(serverKey = 'server1') {
     try {
-      const res = await axios.get(`${ZELAPI_BASE_URL}/api/services`, { timeout: 10000 });
+      const res = await axios.get(`${this.getBaseUrl(serverKey)}/api/services`, { timeout: 10000 });
       return (res.status === 200 && res.data && res.data.success) ? res.data.services : null;
-    } catch { return null; }
+    } catch {
+      return null;
+    }
   }
 
-  static async getCountries(service) {
+  static async getCountries(service, serverKey = 'server1') {
     try {
-      const res = await axios.get(`${ZELAPI_BASE_URL}/api/countries`, { params: { service }, timeout: 10000 });
+      const res = await axios.get(`${this.getBaseUrl(serverKey)}/api/countries`, {
+        params: { service },
+        timeout: 10000
+      });
       return (res.status === 200 && res.data && res.data.success) ? res.data.countries : null;
-    } catch { return null; }
+    } catch {
+      return null;
+    }
   }
 
-  static async requestNumber(service, country) {
+  static async requestNumber(service, country, serverKey = 'server1') {
     try {
-      const res = await axios.post(`${ZELAPI_BASE_URL}/api/request_number`, { service, country }, { timeout: 10000 });
+      const res = await axios.post(`${this.getBaseUrl(serverKey)}/api/request_number`, { service, country }, { timeout: 10000 });
       return (res.status === 200 || res.status === 201) ? res.data : null;
-    } catch { return null; }
+    } catch {
+      return null;
+    }
   }
 
-  static async releaseNumber(number) {
+  static async releaseNumber(number, serverKey = 'server1') {
     try {
       const cleanNum = cleanNumStr(number);
-      const res = await axios.post(`${ZELAPI_BASE_URL}/api/release_number`, { number: cleanNum }, { timeout: 10000 });
+      const res = await axios.post(`${this.getBaseUrl(serverKey)}/api/release_number`, { number: cleanNum }, { timeout: 10000 });
       return (res.status === 200 && res.data) ? res.data : null;
-    } catch { return null; }
+    } catch {
+      return null;
+    }
   }
 
-  static async getPublicOtpFeed(count = 100) {
+  static async getPublicOtpFeed(count = 100, serverKey = 'server1') {
     try {
-      const res = await axios.get(`${ZELAPI_BASE_URL}/api/otp`, { params: { count }, timeout: 10000 });
+      const res = await axios.get(`${this.getBaseUrl(serverKey)}/api/otp`, { params: { count }, timeout: 10000 });
       return res.status === 200 ? res.data : null;
-    } catch { return null; }
+    } catch {
+      return null;
+    }
   }
 
-  static async getStats() {
+  static async getStats(serverKey = 'server1') {
     try {
-      const res = await axios.get(`${ZELAPI_BASE_URL}/api/stats/detailed`, {
+      const res = await axios.get(`${this.getBaseUrl(serverKey)}/api/stats/detailed`, {
         params: { period: 'daily' },
         timeout: 10000
       });
       return res.status === 200 ? res.data : null;
-    } catch { return null; }
+    } catch {
+      return null;
+    }
   }
 
-  static async requestUniqueNumber(service, country, userId, excludeNumber = null) {
+  static async requestUniqueNumber(service, country, userId, excludeNumber = null, serverKey = 'server1') {
     let attempts = 0;
     const maxAttempts = 5;
 
@@ -233,7 +283,7 @@ class ZelApiClient {
 
     while (attempts < maxAttempts) {
       attempts++;
-      const res = await this.requestNumber(service, country);
+      const res = await this.requestNumber(service, country, serverKey);
       if (!res || !res.success || !res.number) {
         return { success: false, error: res?.error || 'Stok nomor sedang kosong atau terjadi kendala API.' };
       }
@@ -241,7 +291,7 @@ class ZelApiClient {
       const cleanNum = cleanNumStr(res.number);
 
       if (userActiveNumbers.includes(cleanNum)) {
-        await this.releaseNumber(cleanNum);
+        await this.releaseNumber(cleanNum, serverKey);
         continue;
       }
 
@@ -255,53 +305,57 @@ class ZelApiClient {
 function startGlobalOtpLoop() {
   setInterval(async () => {
     try {
-      const feed = await ZelApiClient.getPublicOtpFeed(100);
-      if (!Array.isArray(feed)) return;
+      const availableServers = getAvailableServers();
 
-      const activeNumbers = stmtGetAllActiveNumbers.all();
-      if (!activeNumbers || activeNumbers.length === 0) return;
+      for (const server of availableServers) {
+        const feed = await ZelApiClient.getPublicOtpFeed(100, server.key);
+        if (!Array.isArray(feed)) continue;
 
-      const activeMap = new Map();
-      activeNumbers.forEach(item => activeMap.set(cleanNumStr(item.number), item));
+        const activeNumbers = stmtGetAllActiveNumbers.all();
+        if (!activeNumbers || activeNumbers.length === 0) continue;
 
-      for (const item of feed) {
-        if (!Array.isArray(item) || item.length < 4) continue;
-        const [service, rawNum, message, timestamp, country] = item;
-        const cleanNum = cleanNumStr(rawNum);
+        const activeMap = new Map();
+        activeNumbers.forEach(item => activeMap.set(cleanNumStr(item.number), item));
 
-        if (activeMap.has(cleanNum)) {
-          const userNumObj = activeMap.get(cleanNum);
-          const formattedSmsTime = formatApiTimestamp(timestamp);
-          
-          const existingOtp = stmtCheckOtpExists.get(cleanNum, message, formattedSmsTime);
-          if (!existingOtp) {
-            const matchOtp = message.match(/\b\d{3}[-\s]?\d{3,4}\b|\b\d{4,8}\b/);
-            const extractedCode = matchOtp ? matchOtp[0] : 'LIHAT SMS';
+        for (const item of feed) {
+          if (!Array.isArray(item) || item.length < 4) continue;
+          const [service, rawNum, message, timestamp, country] = item;
+          const cleanNum = cleanNumStr(rawNum);
 
-            stmtSaveOtpHistory.run(userNumObj.user_id, cleanNum, service, extractedCode, message, formattedSmsTime);
+          if (activeMap.has(cleanNum)) {
+            const userNumObj = activeMap.get(cleanNum);
+            const formattedSmsTime = formatApiTimestamp(timestamp);
 
-            const text = `📬 <b>NOTIFIKASI SMS/OTP MASUK</b>\n━━━━━━━━━━━━━━━━━━━━\n🔹 <b>Layanan:</b> <code>${service}</code>\n🌍 <b>Negara:</b> <code>${country || userNumObj.country}</code>\n📱 <b>Nomor:</b> <code>${formatPhoneNumber(cleanNum)}</code>\n\n🔑 <b>KODE OTP:</b> <code>${extractedCode}</code>\n\n💬 <b>Isi Pesan:</b>\n<blockquote>${message}</blockquote>\n\n🕒 <b>Waktu:</b> <code>${formattedSmsTime}</code>\n━━━━━━━━━━━━━━━━━━━━\n<i>Sistem tetap memantau nomor ini untuk menerima SMS baru berikutnya.</i>`;
+            const existingOtp = stmtCheckOtpExists.get(cleanNum, message, formattedSmsTime);
+            if (!existingOtp) {
+              const matchOtp = message.match(/\b\d{3}[-\s]?\d{3,4}\b|\b\d{4,8}\b/);
+              const extractedCode = matchOtp ? matchOtp[0] : 'LIHAT SMS';
 
-            const keyboard = Markup.inlineKeyboard([
-              [
-                Markup.button.callback('🔄 Ganti Nomor', `change_${cleanNum}_${service}_${userNumObj.country || 'Default'}`),
-                Markup.button.callback('🗑️ Lepas Nomor', `rel_${cleanNum}_${service}`)
-              ],
-              [
-                Markup.button.callback('📜 Riwayat Nomor Ini', `history_num_${cleanNum}`),
-                Markup.button.callback('📱 Nomor Saya', 'menu_my_numbers')
-              ],
-              [
-                Markup.button.callback('🌐 Layanan', 'menu_services'),
-                Markup.button.callback('🏠 Menu Utama', 'menu_main')
-              ]
-            ]);
+              stmtSaveOtpHistory.run(userNumObj.user_id, cleanNum, service, extractedCode, message, formattedSmsTime);
 
-            bot.telegram.sendMessage(userNumObj.user_id, text, { parse_mode: 'HTML', ...keyboard }).catch(() => {});
+              const text = `📬 <b>NOTIFIKASI SMS/OTP MASUK</b>\n━━━━━━━━━━━━━━━━━━━━\n🔹 <b>Layanan:</b> <code>${service}</code>\n🌍 <b>Negara:</b> <code>${country || userNumObj.country}</code>\n📱 <b>Nomor:</b> <code>${formatPhoneNumber(cleanNum)}</code>\n\n🔑 <b>KODE OTP:</b> <code>${extractedCode}</code>\n\n💬 <b>Isi Pesan:</b>\n<blockquote>${message}</blockquote>\n\n🕒 <b>Waktu:</b> <code>${formattedSmsTime}</code>\n━━━━━━━━━━━━━━━━━━━━\n<i>Sistem tetap memantau nomor ini untuk menerima SMS baru berikutnya.</i>`;
+
+              const keyboard = Markup.inlineKeyboard([
+                [
+                  Markup.button.callback('🔄 Ganti Nomor', `change_${cleanNum}_${service}_${userNumObj.country || 'Default'}`),
+                  Markup.button.callback('🗑️ Lepas Nomor', `rel_${cleanNum}_${service}`)
+                ],
+                [
+                  Markup.button.callback('📜 Riwayat Nomor Ini', `history_num_${cleanNum}`),
+                  Markup.button.callback('📱 Nomor Saya', 'menu_my_numbers')
+                ],
+                [
+                  Markup.button.callback('🌐 Layanan', 'menu_services'),
+                  Markup.button.callback('🏠 Menu Utama', 'menu_main')
+                ]
+              ]);
+
+              bot.telegram.sendMessage(userNumObj.user_id, text, { parse_mode: 'HTML', ...keyboard }).catch(() => {});
+            }
           }
         }
       }
-    } catch (err) {}
+    } catch {}
   }, 4000);
 }
 
@@ -310,7 +364,7 @@ startGlobalOtpLoop();
 function getMainMenuKeyboard(userId) {
   const btns = [
     [
-      Markup.button.callback('🌐 Beli / Sewa Nomor', 'menu_services'),
+      Markup.button.callback('🌐 Pilih Server Endpoint', 'menu_server_select'),
       Markup.button.callback('📱 Nomor Aktif Saya', 'menu_my_numbers')
     ],
     [
@@ -329,6 +383,20 @@ function getMainMenuKeyboard(userId) {
   return Markup.inlineKeyboard(btns);
 }
 
+function getServerSelectKeyboard() {
+  const rows = [];
+  const available = getAvailableServers();
+
+  available.forEach(server => {
+    rows.push([
+      Markup.button.callback(`🌐 ${server.name}`, `server_select_${server.key}`)
+    ]);
+  });
+
+  rows.push([Markup.button.callback('🏠 Menu Utama', 'menu_main')]);
+  return Markup.inlineKeyboard(rows);
+}
+
 function getContactReplyKeyboard() {
   return Markup.keyboard([
     [Markup.button.contactRequest('📲 Verifikasi Kontak Telegram')]
@@ -340,20 +408,20 @@ async function sendMainMenu(ctx) {
   const activeNums = stmtGetUserActiveNumbers.all(userId);
   const otpCountRes = stmtGetUserOtpCount.get(userId);
   const totalUserOtp = otpCountRes ? otpCountRes.total : 0;
-  
+
   const limit = getUserMaxLimit(userId);
   const limitStr = limit === Infinity ? 'Unlimited' : `${limit} Slot`;
   const savedCountStr = `${activeNums.length} / ${limitStr}`;
 
   const text = `✨ <b>SELAMAT DATANG DI ${BOT_NAME.toUpperCase()}</b> ✨\n━━━━━━━━━━━━━━━━━━━━\nHalo <b>${ctx.from.first_name}</b> 👋\nSistem OTP Otomatis & Cek SMS Real-time siap digunakan.\n\n📊 <b>STATUS & METRIK AKUN:</b>\n├ 🟢 <b>Status Server:</b> <code>Normal & Aktif</code>\n├ 📱 <b>Nomor Tersimpan:</b> <code>${savedCountStr}</code>\n├ 📬 <b>Total OTP Diterima:</b> <code>${totalUserOtp} Pesan</code>\n└ 🕒 <b>Waktu Sistem:</b> <code>${getWibTimestamp()}</code>\n━━━━━━━━━━━━━━━━━━━━\n👇 <i>Pilih salah satu menu interaktif di bawah:</i>`;
-  
+
   try {
     if (ctx.callbackQuery) {
       await ctx.editMessageText(text, { parse_mode: 'HTML', ...getMainMenuKeyboard(userId) });
     } else {
       await ctx.reply(text, { parse_mode: 'HTML', ...getMainMenuKeyboard(userId) });
     }
-  } catch (err) {}
+  } catch {}
 }
 
 bot.start(async (ctx) => {
@@ -402,6 +470,52 @@ bot.action('menu_main', async (ctx) => {
   return sendMainMenu(ctx);
 });
 
+bot.action('menu_server_select', async (ctx) => {
+  await safeAnswerCb(ctx, 'Memuat server endpoint...');
+  const text = `🌐 <b>PILIH SERVER ENDPOINT</b>\n━━━━━━━━━━━━━━━━━━━━\nSilakan pilih server endpoint yang ingin Anda gunakan:`;
+
+  return ctx.editMessageText(text, {
+    parse_mode: 'HTML',
+    ...getServerSelectKeyboard()
+  }).catch(() => {});
+});
+
+bot.action(/^server_select_(server[123])$/, async (ctx) => {
+  const serverKey = ctx.match[1];
+  const server = getServerByKey(serverKey);
+
+  stmtSetSession.run(ctx.from.id, 'SELECTED_SERVER', serverKey);
+  await safeAnswerCb(ctx, `Server ${server.name} dipilih`);
+
+  const services = await ZelApiClient.getServices(serverKey);
+
+  if (!services || services.length === 0) {
+    return ctx.editMessageText(`❌ <b>${server.name}</b>\n━━━━━━━━━━━━━━━━━━━━\nServer ini tidak bisa dihubungi atau tidak memiliki layanan aktif.\n\n🌐 <code>${server.baseUrl}</code>\n\n🕒 <code>${getWibTimestamp()}</code>`, {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('🔙 Pilih Server Lain', 'menu_server_select')],
+        [Markup.button.callback('🏠 Menu Utama', 'menu_main')]
+      ])
+    }).catch(() => {});
+  }
+
+  const buttons = services.slice(0, 10).map(item => [
+    Markup.button.callback(`🔹 ${item.name} ── (${item.count} Stok)`, `svc_${serverKey}_${item.name}`)
+  ]);
+
+  buttons.push([
+    Markup.button.callback('🔙 Pilih Server Lain', 'menu_server_select'),
+    Markup.button.callback('🏠 Menu Utama', 'menu_main')
+  ]);
+
+  const text = `🌐 <b>${server.name}</b>\n━━━━━━━━━━━━━━━━━━━━\nBase URL: <code>${server.baseUrl}</code>\n\nPilih layanan yang tersedia di endpoint ini:`;
+
+  return ctx.editMessageText(text, {
+    parse_mode: 'HTML',
+    ...Markup.inlineKeyboard(buttons)
+  }).catch(() => {});
+});
+
 bot.action('menu_manual_check', async (ctx) => {
   await safeAnswerCb(ctx, 'Mode Input Manual...');
   stmtSetSession.run(ctx.from.id, 'WAITING_MANUAL_NUMBER', '');
@@ -424,11 +538,11 @@ bot.on('text', async (ctx, next) => {
 
     const waitMsg = await ctx.reply('⚡ <i>Memvalidasi nomor & memindai SMS publik...</i>', { parse_mode: 'HTML' });
 
-    const releaseRes = await ZelApiClient.releaseNumber(inputNum);
+    const releaseRes = await ZelApiClient.releaseNumber(inputNum, getSelectedServerKey(ctx.from.id));
     const isReleasedSuccess = (releaseRes && releaseRes.success === true);
 
-    const feed = await ZelApiClient.getPublicOtpFeed(100);
-    
+    const feed = await ZelApiClient.getPublicOtpFeed(100, getSelectedServerKey(ctx.from.id));
+
     let foundOtps = [];
     let detectedService = 'Manual Check';
     let detectedCountry = 'Global';
@@ -540,21 +654,31 @@ bot.action('menu_profile', async (ctx) => {
 });
 
 bot.action('menu_services', async (ctx) => {
-  await safeAnswerCb(ctx, 'Memuat Daftar Layanan...');
-  const services = await ZelApiClient.getServices();
+  const selectedServerKey = getSelectedServerKey(ctx.from.id);
+  const server = getServerByKey(selectedServerKey);
+
+  await safeAnswerCb(ctx, 'Memuat daftar layanan...');
+  const services = await ZelApiClient.getServices(selectedServerKey);
 
   if (!services || services.length === 0) {
-    return ctx.editMessageText(`❌ <b>Layanan Sedang Gangguan</b>\n━━━━━━━━━━━━━━━━━━━━\nPenyedia server saat ini tidak dapat dihubungi. Silakan coba sesaat lagi.\n\n🕒 <code>${getWibTimestamp()}</code>`, Markup.inlineKeyboard([
-      [Markup.button.callback('🏠 Menu Utama', 'menu_main')]
-    ]), { parse_mode: 'HTML' }).catch(() => {});
+    return ctx.editMessageText(`❌ <b>Layanan Server Tidak Bisa Diakses</b>\n━━━━━━━━━━━━━━━━━━━━\nEndpoint sedang tidak aktif atau kosong.\n\n🌐 <code>${server.baseUrl}</code>\n\n🕒 <code>${getWibTimestamp()}</code>`, {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('🔙 Pilih Server Lain', 'menu_server_select')],
+        [Markup.button.callback('🏠 Menu Utama', 'menu_main')]
+      ])
+    }).catch(() => {});
   }
 
   const buttons = services.slice(0, 10).map(item => [
-    Markup.button.callback(`🔹 ${item.name} ── (${item.count} Stok)`, `svc_${item.name}`)
+    Markup.button.callback(`🔹 ${item.name} ── (${item.count} Stok)`, `svc_${selectedServerKey}_${item.name}`)
   ]);
-  buttons.push([Markup.button.callback('🏠 Menu Utama', 'menu_main')]);
+  buttons.push([
+    Markup.button.callback('🔙 Pilih Server Lain', 'menu_server_select'),
+    Markup.button.callback('🏠 Menu Utama', 'menu_main')
+  ]);
 
-  const text = `🌐 <b>PILIH PLATFORM / LAYANAN APLIKASI</b>\n━━━━━━━━━━━━━━━━━━━━\nPilih layanan yang ingin Anda daftarkan di bawah ini untuk melihat ketersediaan negara:`;
+  const text = `🌐 <b>${server.name}</b>\n━━━━━━━━━━━━━━━━━━━━\nPilih layanan dari endpoint ini:`;
 
   return ctx.editMessageText(text, {
     parse_mode: 'HTML',
@@ -562,30 +686,44 @@ bot.action('menu_services', async (ctx) => {
   }).catch(() => {});
 });
 
-bot.action(/^svc_(.+)$/, async (ctx) => {
-  const serviceName = ctx.match[1];
-  await safeAnswerCb(ctx, `Memuat Negara ${serviceName}...`);
-  const countries = await ZelApiClient.getCountries(serviceName);
+bot.action(/^svc_(server[123])_(.+)$/, async (ctx) => {
+  const serverKey = ctx.match[1];
+  const serviceName = ctx.match[2];
+  await safeAnswerCb(ctx, `Memuat negara ${serviceName}...`);
+
+  const countries = await ZelApiClient.getCountries(serviceName, serverKey);
 
   if (!countries || countries.length === 0) {
-    return ctx.editMessageText(`❌ <b>Stok Negara Kosong</b>\n━━━━━━━━━━━━━━━━━━━━\nSaat ini stok negara untuk layanan <b>${serviceName}</b> sedang habis.\n\n🕒 <code>${getWibTimestamp()}</code>`, {
+    return ctx.editMessageText(`❌ <b>Stok Negara Kosong</b>\n━━━━━━━━━━━━━━━━━━━━\nSaat ini stok negara untuk layanan <b>${serviceName}</b> pada server <b>${getServerByKey(serverKey).name}</b> sedang habis.\n\n🕒 <code>${getWibTimestamp()}</code>`, {
       parse_mode: 'HTML',
-      ...Markup.inlineKeyboard([[Markup.button.callback('🔙 Pilih Layanan Lain', 'menu_services')]])
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('🔙 Pilih Layanan Lain', 'menu_services')],
+        [Markup.button.callback('🏠 Menu Utama', 'menu_main')]
+      ])
     }).catch(() => {});
   }
 
   const buttons = countries.slice(0, 10).map(item => [
-    Markup.button.callback(`🏳️ ${item.name} ── (${item.count} Stok)`, `req_${serviceName}_${item.name}`)
+    Markup.button.callback(`🏳️ ${item.name} ── (${item.count} Stok)`, `req_${serverKey}_${serviceName}_${item.name}`)
   ]);
-  buttons.push([Markup.button.callback('🔙 Pilih Layanan Lain', 'menu_services')]);
 
-  const text = `📦 <b>PILIH NEGARA ASAL NOMOR</b>\n━━━━━━━━━━━━━━━━━━━━\n📌 <b>Layanan:</b> <code>${serviceName.toUpperCase()}</code>\nSilakan pilih negara asal nomor virtual:`;
-  return ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) }).catch(() => {});
+  buttons.push([
+    Markup.button.callback('🔙 Pilih Layanan Lain', 'menu_services'),
+    Markup.button.callback('🏠 Menu Utama', 'menu_main')
+  ]);
+
+  const text = `📦 <b>PILIH NEGARA ASAL NOMOR</b>\n━━━━━━━━━━━━━━━━━━━━\n📌 <b>Server:</b> <code>${getServerByKey(serverKey).name}</code>\n📌 <b>Layanan:</b> <code>${serviceName.toUpperCase()}</code>\nSilakan pilih negara asal nomor virtual:`;
+
+  return ctx.editMessageText(text, {
+    parse_mode: 'HTML',
+    ...Markup.inlineKeyboard(buttons)
+  }).catch(() => {});
 });
 
-bot.action(/^req_(.+)_(.+)$/, async (ctx) => {
-  const serviceName = ctx.match[1];
-  const countryName = ctx.match[2];
+bot.action(/^req_(server[123])_(.+)_(.+)$/, async (ctx) => {
+  const serverKey = ctx.match[1];
+  const serviceName = ctx.match[2];
+  const countryName = ctx.match[3];
   const userId = ctx.from.id;
 
   const activeNums = stmtGetUserActiveNumbers.all(userId);
@@ -603,18 +741,18 @@ bot.action(/^req_(.+)_(.+)$/, async (ctx) => {
   }
 
   await safeAnswerCb(ctx, 'Memesan nomor baru...');
-  const res = await ZelApiClient.requestUniqueNumber(serviceName, countryName, userId);
+  const res = await ZelApiClient.requestUniqueNumber(serviceName, countryName, userId, null, serverKey);
 
   if (res && res.success) {
     const rawNumber = res.number;
     const cleanNum = cleanNumStr(rawNumber);
     const formattedNum = formatPhoneNumber(cleanNum);
     const reqId = res.id || '-';
-    
+
     stmtAddActiveNumber.run(ctx.from.id, cleanNum, serviceName, countryName);
 
-    const text = `🎉 <b>NOMOR VIRTUAL BERHASIL DIPESAN!</b>\n━━━━━━━━━━━━━━━━━━━━\n🔹 <b>Layanan:</b> <code>${serviceName}</code>\n🌍 <b>Negara:</b> <code>${countryName}</code>\n📱 <b>Nomor Virtual:</b> <code>${formattedNum}</code>\n🆔 <b>Order ID:</b> <code>${reqId}</code>\n\n🕒 <b>Waktu:</b> <code>${getWibTimestamp()}</code>\n━━━━━━━━━━━━━━━━━━━━\n💡 <b>Petunjuk:</b> Masukkan nomor ke aplikasi tujuan. Sistem akan otomatis mendeteksi dan mengirim SMS berulang selagi nomor belum dilepas.`;
-    
+    const text = `🎉 <b>NOMOR VIRTUAL BERHASIL DIPESAN!</b>\n━━━━━━━━━━━━━━━━━━━━\n🔹 <b>Server:</b> <code>${getServerByKey(serverKey).name}</code>\n🔹 <b>Layanan:</b> <code>${serviceName}</code>\n🌍 <b>Negara:</b> <code>${countryName}</code>\n📱 <b>Nomor Virtual:</b> <code>${formattedNum}</code>\n🆔 <b>Order ID:</b> <code>${reqId}</code>\n\n🕒 <b>Waktu:</b> <code>${getWibTimestamp()}</code>\n━━━━━━━━━━━━━━━━━━━━\n💡 <b>Petunjuk:</b> Masukkan nomor ke aplikasi tujuan. Sistem akan otomatis mendeteksi dan mengirim SMS berulang selagi nomor belum dilepas.`;
+
     const keyboard = Markup.inlineKeyboard([
       [Markup.button.callback('⚡ Cek OTP Manual', `otp_${cleanNum}_${serviceName}_${countryName}`)],
       [
@@ -630,15 +768,17 @@ bot.action(/^req_(.+)_(.+)$/, async (ctx) => {
         Markup.button.callback('🏠 Menu Utama', 'menu_main')
       ]
     ]);
+
     return ctx.editMessageText(text, { parse_mode: 'HTML', ...keyboard }).catch(() => {});
   } else {
     const errorMsg = (res && res.error) ? res.error : 'Stok habis atau server mengalami gangguan.';
-    const text = `❌ <b>GAGAL MEMESAN NOMOR!</b>\n━━━━━━━━━━━━━━━━━━━━\n🔹 <b>Layanan:</b> <code>${serviceName}</code>\n🌍 <b>Negara:</b> <code>${countryName}</code>\n⚠️ <b>Alasan:</b> ${errorMsg}\n\n🕒 <code>${getWibTimestamp()}</code>`;
-    
+    const text = `❌ <b>GAGAL MEMESAN NOMOR!</b>\n━━━━━━━━━━━━━━━━━━━━\n🔹 <b>Server:</b> <code>${getServerByKey(serverKey).name}</code>\n🔹 <b>Layanan:</b> <code>${serviceName}</code>\n🌍 <b>Negara:</b> <code>${countryName}</code>\n⚠️ <b>Alasan:</b> ${errorMsg}\n\n🕒 <code>${getWibTimestamp()}</code>`;
+
     const keyboard = Markup.inlineKeyboard([
-      [Markup.button.callback('🔙 Pilih Negara Lain', `svc_${serviceName}`)],
+      [Markup.button.callback('🔙 Pilih Negara Lain', `svc_${serverKey}_${serviceName}`)],
       [Markup.button.callback('🏠 Menu Utama', 'menu_main')]
     ]);
+
     return ctx.editMessageText(text, { parse_mode: 'HTML', ...keyboard }).catch(() => {});
   }
 });
@@ -649,11 +789,12 @@ bot.action(/^change_(.+)_(.+)_(.+)$/, async (ctx) => {
   const oldCleanNum = cleanNumStr(oldRawNum);
   const serviceName = ctx.match[2];
   const countryName = ctx.match[3];
+  const serverKey = getSelectedServerKey(ctx.from.id);
 
-  await ZelApiClient.releaseNumber(oldCleanNum);
+  await ZelApiClient.releaseNumber(oldCleanNum, serverKey);
   stmtReleaseActiveNumber.run(oldCleanNum, ctx.from.id);
 
-  const res = await ZelApiClient.requestUniqueNumber(serviceName, countryName, ctx.from.id, oldCleanNum);
+  const res = await ZelApiClient.requestUniqueNumber(serviceName, countryName, ctx.from.id, oldCleanNum, serverKey);
 
   if (res && res.success) {
     const newRawNum = res.number;
@@ -663,8 +804,8 @@ bot.action(/^change_(.+)_(.+)_(.+)$/, async (ctx) => {
 
     stmtAddActiveNumber.run(ctx.from.id, newCleanNum, serviceName, countryName);
 
-    const text = `🔄 <b>NOMOR BERHASIL DIGANTI!</b>\n━━━━━━━━━━━━━━━━━━━━\n🔹 <b>Layanan:</b> <code>${serviceName}</code>\n🌍 <b>Negara:</b> <code>${countryName}</code>\n📱 <b>Nomor Baru:</b> <code>${formattedNum}</code>\n🗑️ <b>Nomor Lama Dilepas:</b> <code>${formatPhoneNumber(oldCleanNum)}</code>\n🆔 <b>Order ID:</b> <code>${reqId}</code>\n\n🕒 <b>Waktu:</b> <code>${getWibTimestamp()}</code>\n━━━━━━━━━━━━━━━━━━━━\n💡 <i>Sistem otomatis memantau nomor baru ini dan memastikan nomor berbeda dari nomor sebelumnya.</i>`;
-    
+    const text = `🔄 <b>NOMOR BERHASIL DIGANTI!</b>\n━━━━━━━━━━━━━━━━━━━━\n🔹 <b>Server:</b> <code>${getServerByKey(serverKey).name}</code>\n🔹 <b>Layanan:</b> <code>${serviceName}</code>\n🌍 <b>Negara:</b> <code>${countryName}</code>\n📱 <b>Nomor Baru:</b> <code>${formattedNum}</code>\n🗑️ <b>Nomor Lama Dilepas:</b> <code>${formatPhoneNumber(oldCleanNum)}</code>\n🆔 <b>Order ID:</b> <code>${reqId}</code>\n\n🕒 <b>Waktu:</b> <code>${getWibTimestamp()}</code>\n━━━━━━━━━━━━━━━━━━━━\n💡 <i>Sistem otomatis memantau nomor baru ini dan memastikan nomor berbeda dari nomor sebelumnya.</i>`;
+
     const keyboard = Markup.inlineKeyboard([
       [Markup.button.callback('⚡ Cek OTP Manual', `otp_${newCleanNum}_${serviceName}_${countryName}`)],
       [
@@ -680,15 +821,17 @@ bot.action(/^change_(.+)_(.+)_(.+)$/, async (ctx) => {
         Markup.button.callback('🏠 Menu Utama', 'menu_main')
       ]
     ]);
+
     return ctx.editMessageText(text, { parse_mode: 'HTML', ...keyboard }).catch(() => {});
   } else {
     const errorMsg = (res && res.error) ? res.error : 'Stok habis atau server gangguan.';
     const text = `⚠️ <b>PERHATIAN!</b>\n━━━━━━━━━━━━━━━━━━━━\nNomor lama <code>${formatPhoneNumber(oldCleanNum)}</code> berhasil dilepaskan, namun server gagal memberikan nomor pengganti baru.\n\n⚠️ <b>Keterangan:</b> ${errorMsg}\n🕒 <code>${getWibTimestamp()}</code>`;
-    
+
     const keyboard = Markup.inlineKeyboard([
       [Markup.button.callback('🌐 Beli Layanan Lain', 'menu_services')],
       [Markup.button.callback('🏠 Menu Utama', 'menu_main')]
     ]);
+
     return ctx.editMessageText(text, { parse_mode: 'HTML', ...keyboard }).catch(() => {});
   }
 });
@@ -698,11 +841,12 @@ bot.action(/^otp_([^_]+)(?:_(.+)_(.+))?$/, async (ctx) => {
   const cleanNum = cleanNumStr(rawNum);
   const serviceName = ctx.match[2] || 'Unknown';
   const countryName = ctx.match[3] || 'Unknown';
+  const serverKey = getSelectedServerKey(ctx.from.id);
 
   await safeAnswerCb(ctx, 'Memeriksa SMS...');
-  
-  await ZelApiClient.releaseNumber(cleanNum);
-  const feed = await ZelApiClient.getPublicOtpFeed(100);
+
+  await ZelApiClient.releaseNumber(cleanNum, serverKey);
+  const feed = await ZelApiClient.getPublicOtpFeed(100, serverKey);
 
   let otpFound = null;
   if (Array.isArray(feed)) {
@@ -756,12 +900,13 @@ bot.action(/^rel_([^_]+)(?:_(.+))?$/, async (ctx) => {
   const rawNum = ctx.match[1];
   const cleanNum = cleanNumStr(rawNum);
   const serviceName = ctx.match[2] || 'Layanan';
+  const serverKey = getSelectedServerKey(ctx.from.id);
 
-  await ZelApiClient.releaseNumber(cleanNum);
+  await ZelApiClient.releaseNumber(cleanNum, serverKey);
   stmtReleaseActiveNumber.run(cleanNum, ctx.from.id);
 
   const text = `🗑️ <b>NOMOR BERHASIL DILEPASKAN!</b>\n━━━━━━━━━━━━━━━━━━━━\n📱 <b>Nomor Virtual:</b> <code>${formatPhoneNumber(cleanNum)}</code>\n🔹 <b>Layanan:</b> <code>${serviceName}</code>\n\n🕒 <b>Waktu:</b> <code>${getWibTimestamp()}</code>\n━━━━━━━━━━━━━━━━━━━━\n<i>Nomor ini telah resmi dikembalikan dan tidak lagi aktif dalam antrean pemantauan Anda.</i>`;
-  
+
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback('📱 Kelola Nomor Aktif', 'menu_my_numbers')],
     [Markup.button.callback('🌐 Beli Nomor Baru', 'menu_services')],
@@ -778,7 +923,7 @@ bot.action('menu_my_numbers', async (ctx) => {
   if (!activeDbNumbers || activeDbNumbers.length === 0) {
     const text = `📭 <b>TIDAK ADA NOMOR AKTIF</b>\n━━━━━━━━━━━━━━━━━━━━\nSaat ini Anda belum memiliki nomor virtual yang sedang disewa.\n\n🕒 <code>${getWibTimestamp()}</code>`;
     const keyboard = Markup.inlineKeyboard([
-      [Markup.button.callback('🌐 Beli / Sewa Nomor Baru', 'menu_services')],
+      [Markup.button.callback('🌐 Beli / Sewa Nomor Baru', 'menu_server_select')],
       [Markup.button.callback('🏠 Menu Utama', 'menu_main')]
     ]);
     return ctx.editMessageText(text, { parse_mode: 'HTML', ...keyboard }).catch(() => {});
@@ -788,14 +933,14 @@ bot.action('menu_my_numbers', async (ctx) => {
   const limitStr = limit === Infinity ? 'Unlimited' : `${limit} Slot`;
 
   const text = `📱 <b>DAFTAR NOMOR VIRTUAL ANDA (${activeDbNumbers.length} / ${limitStr})</b>\n━━━━━━━━━━━━━━━━━━━━\nKlik pada tombol nomor di bawah untuk cek SMS, ganti nomor, atau melepaskan sewa:\n\n🕒 <code>${getWibTimestamp()}</code>`;
-  
+
   const buttons = activeDbNumbers.map(item => [
     Markup.button.callback(`📱 ${formatPhoneNumber(item.number)} ── [${item.service}]`, `otp_${item.number}_${item.service}_${item.country}`)
   ]);
-  
+
   buttons.push([
     Markup.button.callback('📜 Riwayat OTP Global', 'menu_history_global'),
-    Markup.button.callback('🌐 Beli Nomor Lagi', 'menu_services')
+    Markup.button.callback('🌐 Beli Nomor Lagi', 'menu_server_select')
   ]);
   buttons.push([Markup.button.callback('🏠 Menu Utama', 'menu_main')]);
 
@@ -833,7 +978,7 @@ bot.action(/^menu_history_global(?:_(\d+))?$/, async (ctx) => {
   if (page < totalPages) navRow.push(Markup.button.callback('Selanjutnya ▶️', `menu_history_global_${page + 1}`));
   if (navRow.length > 0) buttons.push(navRow);
 
-  buttons.push([Markup.button.callback('📱 Nomor Saya', 'menu_my_numbers'), Markup.button.callback('🌐 Layanan', 'menu_services')]);
+  buttons.push([Markup.button.callback('📱 Nomor Saya', 'menu_my_numbers'), Markup.button.callback('🌐 Layanan', 'menu_server_select')]);
   buttons.push([Markup.button.callback('🏠 Menu Utama', 'menu_main')]);
 
   return ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) }).catch(() => {});
@@ -879,11 +1024,12 @@ bot.action(/^history_num_([0-9]+)(?:_(\d+))?$/, async (ctx) => {
 
 bot.action('menu_stats', async (ctx) => {
   await safeAnswerCb(ctx, 'Memuat Statistik...');
-  const stats = await ZelApiClient.getStats();
+  const serverKey = getSelectedServerKey(ctx.from.id);
+  const stats = await ZelApiClient.getStats(serverKey);
 
   let text = '';
   if (stats) {
-    text = `📊 <b>STATISTIK & KONDISI SERVER HARIAN</b>\n━━━━━━━━━━━━━━━━━━━━\n📩 <b>Total Sukses OTP:</b> <code>${stats.otp_count || 0}</code>\n🌍 <b>Negara Tersedia:</b> <code>${stats.countries_count || 0}</code>\n🌐 <b>Layanan Aktif:</b> <code>${stats.services_count || 0}</code>\n📱 <b>Total Stok Tersedia:</b> <code>${stats.available_numbers || 0}</code>\n\n🕒 <b>Update:</b> <code>${getWibTimestamp()}</code>\n━━━━━━━━━━━━━━━━━━━━\n<i>Data metrik disinkronkan langsung dari server pusat ZELAPI.</i>`;
+    text = `📊 <b>STATISTIK & KONDISI SERVER HARIAN</b>\n━━━━━━━━━━━━━━━━━━━━\n📌 <b>Server:</b> <code>${getServerByKey(serverKey).name}</code>\n📩 <b>Total Sukses OTP:</b> <code>${stats.otp_count || 0}</code>\n🌍 <b>Negara Tersedia:</b> <code>${stats.countries_count || 0}</code>\n🌐 <b>Layanan Aktif:</b> <code>${stats.services_count || 0}</code>\n📱 <b>Total Stok Tersedia:</b> <code>${stats.available_numbers || 0}</code>\n\n🕒 <b>Update:</b> <code>${getWibTimestamp()}</code>\n━━━━━━━━━━━━━━━━━━━━\n<i>Data metrik disinkronkan langsung dari server pusat ZELAPI.</i>`;
   } else {
     text = `❌ <b>GAGAL MEMUAT STATISTIK</b>\n━━━━━━━━━━━━━━━━━━━━\nServer sedang lambat merespons permintaan metrik.\n\n🕒 <code>${getWibTimestamp()}</code>`;
   }
